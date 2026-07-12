@@ -386,44 +386,51 @@ def main():
         st.caption(f"Intent weight: {w_intent}")
         run = st.button("Pull live filings", type="primary")
 
-    if not run:
+    # Only fetch when the button is clicked; store results so later interactions
+    # (like the score-breakdown dropdown) don't wipe the page on Streamlit's rerun.
+    if run:
+        with st.status("Querying SEC EDGAR live...", expanded=False) as status:
+            try:
+                raw = search_recent_form_d(days, email, max_scan=scan)
+            except Exception as e:
+                st.error(f"EDGAR search failed: {e}")
+                st.session_state.pop("rows", None)
+                return
+            status.update(label=f"Found {len(raw)} filings. Fetching Form D details...")
+            rows = []
+            for rec in raw[:detail]:
+                if not rec.get("cik") or not rec.get("accession"):
+                    continue
+                rec.update(fetch_form_d_details(rec["cik"], rec["accession"], email))
+                time.sleep(0.15)
+                if (rec.get("industry") or "") in EXCLUDE_INDUSTRIES:
+                    continue
+                rec.update(score_account(rec, states, sweet_low, sweet_high, w_fit, w_intent))
+                rows.append(rec)
+
+            rows.sort(key=lambda r: r["score"], reverse=True)
+
+            if do_hiring and hire_n:
+                status.update(label=f"Checking live hiring signals for top {hire_n}...")
+                for rec in rows[:hire_n]:
+                    hiring = fetch_hiring_signal(rec["name"], email)
+                    rec["hiring_found"] = hiring["found"]
+                    rec["hiring_jobs"] = hiring["n_jobs"]
+                    rec["multistate"] = hiring["multistate"]
+                    rec["international"] = hiring["international"]
+                    rec.update(score_account(rec, states, sweet_low, sweet_high, w_fit, w_intent, hiring))
+                rows.sort(key=lambda r: r["score"], reverse=True)
+            status.update(label="Done", state="complete")
+        st.session_state["rows"] = rows
+
+    # Render from stored results (persists across reruns from any widget).
+    if "rows" not in st.session_state:
         st.info("Set controls and click **Pull live filings**. The app queries SEC EDGAR live, "
                 "drops investment funds/SPVs, enriches with live hiring signals, and ranks real "
                 "operating companies as Justworks targets.")
         return
 
-    with st.status("Querying SEC EDGAR live...", expanded=False) as status:
-        try:
-            raw = search_recent_form_d(days, email, max_scan=scan)
-        except Exception as e:
-            st.error(f"EDGAR search failed: {e}")
-            return
-        status.update(label=f"Found {len(raw)} filings. Fetching Form D details...")
-        rows = []
-        for rec in raw[:detail]:
-            if not rec.get("cik") or not rec.get("accession"):
-                continue
-            rec.update(fetch_form_d_details(rec["cik"], rec["accession"], email))
-            time.sleep(0.15)
-            if (rec.get("industry") or "") in EXCLUDE_INDUSTRIES:
-                continue
-            rec.update(score_account(rec, states, sweet_low, sweet_high, w_fit, w_intent))
-            rows.append(rec)
-
-        rows.sort(key=lambda r: r["score"], reverse=True)
-
-        if do_hiring and hire_n:
-            status.update(label=f"Checking live hiring signals for top {hire_n}...")
-            for rec in rows[:hire_n]:
-                hiring = fetch_hiring_signal(rec["name"], email)
-                rec["hiring_found"] = hiring["found"]
-                rec["hiring_jobs"] = hiring["n_jobs"]
-                rec["multistate"] = hiring["multistate"]
-                rec["international"] = hiring["international"]
-                rec.update(score_account(rec, states, sweet_low, sweet_high, w_fit, w_intent, hiring))
-            rows.sort(key=lambda r: r["score"], reverse=True)
-        status.update(label="Done", state="complete")
-
+    rows = st.session_state["rows"]
     if not rows:
         st.warning("No operating companies matched after filtering. Widen the window or clear filters.")
         return
