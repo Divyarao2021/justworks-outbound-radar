@@ -31,9 +31,16 @@ LEVER_URL = "https://api.lever.co/v0/postings/{token}?mode=json"
 THIS_YEAR = dt.date.today().year
 
 EXCLUDE_INDUSTRIES = {
+    # Financial vehicles
     "Pooled Investment Fund", "Investing", "Investment Banking",
-    "Commercial Banking", "Insurance", "Other Banking and Financial Services",
-    "REITS and Finance",
+    "Commercial Banking", "Insurance", "Health Insurance",
+    "Other Banking and Financial Services", "REITS and Finance",
+    # Real estate vehicles (Form D Real Estate subtypes)
+    "Commercial", "Construction", "Residential", "Other Real Estate",
+    # Extractive energy / utilities - capital vehicles, not SMB PEO buyers
+    "Coal Mining", "Oil and Gas", "Electric Utilities", "Other Energy",
+    # Land / farm vehicles
+    "Agriculture",
 }
 STRONG_FIT_INDUSTRIES = {
     "Technology", "Computers", "Telecommunications", "Other Technology",
@@ -41,6 +48,21 @@ STRONG_FIT_INDUSTRIES = {
     "Other Health Care", "Retailing", "Restaurants", "Manufacturing",
     "Tourism and Travel Services", "Other Travel",
 }
+SECONDARY_FIT_INDUSTRIES = {
+    "Environmental Services", "Energy Conservation",
+    "Hospitals and Physicians", "Airlines and Airports", "Lodging and Conventions",
+}
+# Names that signal an investment / holding vehicle rather than an operating
+# company with W-2 employees (the ones that slip through as industry "Other").
+_VEHICLE_RE = re.compile(
+    r"\b(funds?|funding|spv|sidecar|co-?invest|reits?|realty|propert(?:y|ies)|"
+    r"holdings?|opportunit(?:y|ies))\b|\bside\s+car\b|\bacquisition\s+corp\b|"
+    r"\bl\.?\s?p\.?\s*$", re.I)
+
+
+def is_vehicle_name(name):
+    return bool(name and _VEHICLE_RE.search(name))
+
 SMALL_REVENUE = {"No Revenues", "$1 - $1,000,000", "$1,000,000 - $5,000,000"}
 
 US_STATES = {
@@ -258,8 +280,10 @@ def score_account(rec, target_states, sweet_low, sweet_high, w_fit, w_intent, hi
     # ---- FIT (0-60) ----
     if industry in STRONG_FIT_INDUSTRIES:
         fit_items.append((f"{industry} operating company", 26))
-    elif industry and industry not in EXCLUDE_INDUSTRIES:
+    elif industry in SECONDARY_FIT_INDUSTRIES:
         fit_items.append((f"{industry} (secondary-fit industry)", 12))
+    elif industry:
+        fit_items.append((f"{industry} (weak-fit / generic industry)", 4))
     if offering is not None:
         if sweet_low <= offering <= sweet_high:
             fit_items.append(("Raise in SMB sweet spot", 16))
@@ -397,13 +421,18 @@ def main():
                 st.session_state.pop("rows", None)
                 return
             status.update(label=f"Found {len(raw)} filings. Fetching Form D details...")
-            rows = []
+            rows, excluded = [], []
             for rec in raw[:detail]:
                 if not rec.get("cik") or not rec.get("accession"):
                     continue
                 rec.update(fetch_form_d_details(rec["cik"], rec["accession"], email))
                 time.sleep(0.15)
-                if (rec.get("industry") or "") in EXCLUDE_INDUSTRIES:
+                ind = rec.get("industry") or ""
+                if ind in EXCLUDE_INDUSTRIES:
+                    excluded.append((rec["name"], f"non-ICP industry: {ind}"))
+                    continue
+                if is_vehicle_name(rec["name"]):
+                    excluded.append((rec["name"], "investment / holding vehicle (name)"))
                     continue
                 rec.update(score_account(rec, states, sweet_low, sweet_high, w_fit, w_intent))
                 rows.append(rec)
@@ -422,6 +451,7 @@ def main():
                 rows.sort(key=lambda r: r["score"], reverse=True)
             status.update(label="Done", state="complete")
         st.session_state["rows"] = rows
+        st.session_state["excluded"] = excluded
 
     # Render from stored results (persists across reruns from any widget).
     if "rows" not in st.session_state:
@@ -431,8 +461,11 @@ def main():
         return
 
     rows = st.session_state["rows"]
+    excluded = st.session_state.get("excluded", [])
     if not rows:
         st.warning("No operating companies matched after filtering. Widen the window or clear filters.")
+        if excluded:
+            st.caption(f"(Filtered out {len(excluded)} non-ICP entities such as funds and real-estate vehicles.)")
         return
 
     df = pd.DataFrame(rows)
@@ -444,6 +477,13 @@ def main():
     c2.metric("A-tier (strike now)", int(df["tier"].str.startswith("A").sum()))
     c3.metric("Hiring multi-state", int(df.get("multistate", pd.Series(dtype=bool)).sum()))
     c4.metric("Hiring international", int(df.get("international", pd.Series(dtype=bool)).sum()))
+
+    if excluded:
+        with st.expander(f"Filtered out {len(excluded)} non-ICP entities "
+                         f"(investment funds, real-estate / energy vehicles, holding companies)"):
+            st.caption("These filed a Form D but are not Justworks buyers - kept out of the target list on purpose.")
+            st.dataframe(pd.DataFrame(excluded, columns=["Entity", "Why excluded"]),
+                         hide_index=True, use_container_width=True)
 
     cols = ["name", "score", "tier", "industry", "total_offering", "revenue_range", "state",
             "file_date", "hiring_jobs", "multistate", "international", "why", "play", "EDGAR"]
